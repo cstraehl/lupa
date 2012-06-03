@@ -191,13 +191,9 @@ cdef class LuaRuntime:
           print("LUPA: loaded ljarray.narray")
           _has_ljarray = 1
           self._convert_ndarray = narray.fromNumpyArray
-          print("LUPA: SUCCESS", self._convert_ndarray)
         except:
           print("LUPA: you may want to install LJARRAY for automatic numpy.ndarray <-> luajit interop")
     
-    cdef object ndarray_to_lua(self, object o):
-        return self._convert_ndarray(o)
-
     def __dealloc__(self):
         if self._state is not NULL:
             lua.lua_close(self._state)
@@ -891,7 +887,7 @@ cdef int py_to_lua(LuaRuntime runtime, lua_State *L, object o, bint withnone) ex
             # with pushed_values_count == 0.
             lua.lua_pushnil(L)
             pushed_values_count = 1
-    elif type(o) is np.ndarray:
+    elif type(o) is np.ndarray and runtime._convert_ndarray:
         # save lua stack pointer
         stack_index = lua.lua_gettop(L)
         runtime._convert_ndarray.push_lua_object()
@@ -903,15 +899,12 @@ cdef int py_to_lua(LuaRuntime runtime, lua_State *L, object o, bint withnone) ex
             runtime.reraise_on_exception()
             if result_status:
                 raise_lua_error(runtime, L, result_status)
-            # determine number of results and retrieve them
-            result_length = lua.lua_gettop(L) - stack_index
             retval = py_from_lua(runtime, L, stack_index + 1)
         finally:
             # restore lua stack pointer
             lua.lua_settop(L, stack_index)
 
         pushed_values_count = py_to_lua(runtime, L, retval, withnone)
-        print("retvals: ", retval)
     elif type(o) is bool:
         lua.lua_pushboolean(L, <bint>o)
         pushed_values_count = 1
