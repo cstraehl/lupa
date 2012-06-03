@@ -30,6 +30,8 @@ try:
 except ImportError:
     import builtins
 
+cdef int _has_ljarray = 0
+
 DEF POBJECT = "POBJECT" # as used by LunaticPython
 
 cdef class _LuaObject
@@ -44,6 +46,58 @@ cdef struct py_object:
     PyObject* obj
     PyObject* runtime
     int type_flags  # or-ed set of WrappedObjectFlags
+
+from libc.stdlib cimport free
+from cpython cimport PyObject, Py_INCREF
+
+# Import the Python-level symbols of numpy
+import numpy as np
+
+# Import the C-level symbols of numpy
+cimport numpy as np
+
+# Numpy must be initialized. When using numpy from C or Cython you must
+# _always_ do that, or you will have segfaults
+np.import_array()
+
+# We need to build an array-wrapper class to deallocate our array when
+# the Python object is deleted.
+
+cdef class ArrayWrapper:
+    cdef void* data_ptr
+    cdef int size
+
+    cdef set_data(self, int size, void* data_ptr):
+        """ Set the data of the array
+
+        This cannot be done in the constructor as it must recieve C-level
+        arguments.
+
+        Parameters:
+        -----------
+        size: int
+            Length of the array.
+        data_ptr: void*
+            Pointer to the data            
+
+        """
+        self.data_ptr = data_ptr
+        self.size = size
+
+    def __array__(self):
+        """ Here we use the __array__ method, that is called when numpy
+            tries to get an array from the object."""
+        cdef np.npy_intp shape[1]
+        shape[0] = <np.npy_intp> self.size
+        # Create a 1D array, of length 'size'
+        ndarray = np.PyArray_SimpleNewFromData(1, shape,
+                                               np.NPY_INT, self.data_ptr)
+        return ndarray
+
+    def __dealloc__(self):
+        """ Frees the array. This is called by Python when all the
+        references to the object are gone. """
+        free(<void*>self.data_ptr)
 
 include "lock.pxi"
 
@@ -107,6 +161,7 @@ cdef class LuaRuntime:
     cdef bytes _encoding
     cdef bytes _source_encoding
     cdef object _attribute_filter
+    cdef _LuaObject _convert_ndarray
 
     def __cinit__(self, encoding='UTF-8', source_encoding=None,
                   attribute_filter=None, bint register_eval=True):
@@ -119,11 +174,29 @@ cdef class LuaRuntime:
         self._encoding = None if encoding is None else encoding.encode('ASCII')
         self._source_encoding = source_encoding or self._encoding or b'UTF-8'
         self._attribute_filter = attribute_filter
+        self._convert_ndarray = None
 
         lua.luaL_openlibs(L)
         self.init_python_lib(register_eval)
         lua.lua_settop(L, 0)
         lua.lua_atpanic(L, <lua.lua_CFunction>1)
+        # try loading luarocks
+        try:
+          self.require("luarocks.loader")
+        except:
+          pass
+        # try loading ljarray
+        try:
+          narray = self.require("ljarray.narray")
+          print("LUPA: loaded ljarray.narray")
+          _has_ljarray = 1
+          self._convert_ndarray = narray.fromNumpyArray
+          print("LUPA: SUCCESS", self._convert_ndarray)
+        except:
+          print("LUPA: you may want to install LJARRAY for automatic numpy.ndarray <-> luajit interop")
+    
+    cdef object ndarray_to_lua(self, object o):
+        return self._convert_ndarray(o)
 
     def __dealloc__(self):
         if self._state is not NULL:
@@ -818,6 +891,27 @@ cdef int py_to_lua(LuaRuntime runtime, lua_State *L, object o, bint withnone) ex
             # with pushed_values_count == 0.
             lua.lua_pushnil(L)
             pushed_values_count = 1
+    elif type(o) is np.ndarray:
+        # save lua stack pointer
+        stack_index = lua.lua_gettop(L)
+        runtime._convert_ndarray.push_lua_object()
+        py_to_lua_custom(runtime, L, o, type_flags) 
+        try:
+            # call into Lua
+            nargs = 1
+            result_status = lua.lua_pcall(L, nargs, lua.LUA_MULTRET, 0)
+            runtime.reraise_on_exception()
+            if result_status:
+                raise_lua_error(runtime, L, result_status)
+            # determine number of results and retrieve them
+            result_length = lua.lua_gettop(L) - stack_index
+            retval = py_from_lua(runtime, L, stack_index + 1)
+        finally:
+            # restore lua stack pointer
+            lua.lua_settop(L, stack_index)
+
+        pushed_values_count = py_to_lua(runtime, L, retval, withnone)
+        print("retvals: ", retval)
     elif type(o) is bool:
         lua.lua_pushboolean(L, <bint>o)
         pushed_values_count = 1
