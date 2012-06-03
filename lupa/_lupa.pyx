@@ -13,7 +13,15 @@ cimport cpython.bytes
 cimport cpython.tuple
 cimport cpython.float
 cimport cpython.long
-from cpython.ref cimport PyObject
+from cpython.ref cimport PyObject 
+
+cdef extern from "Python.h":
+    ctypedef struct PyTypeObject:
+        pass
+
+cdef extern from "numpy/arrayobject.h":
+    PyTypeObject PyArray_Type
+
 from cpython.version cimport PY_VERSION_HEX, PY_MAJOR_VERSION
 
 cdef extern from *:
@@ -47,7 +55,7 @@ cdef struct py_object:
     PyObject* runtime
     int type_flags  # or-ed set of WrappedObjectFlags
 
-from libc.stdlib cimport free
+from libc.stdlib cimport malloc,free
 from cpython cimport PyObject, Py_INCREF
 
 # Import the Python-level symbols of numpy
@@ -63,41 +71,56 @@ np.import_array()
 # We need to build an array-wrapper class to deallocate our array when
 # the Python object is deleted.
 
-cdef class ArrayWrapper:
+cdef class LuaArrayWrapper:
+    cdef _LuaObject larray
     cdef void* data_ptr
     cdef int size
+    cdef int _ref
+    cdef object shape
+    cdef object strides
+    cdef object dtype
 
-    cdef set_data(self, int size, void* data_ptr):
-        """ Set the data of the array
-
-        This cannot be done in the constructor as it must recieve C-level
-        arguments.
-
-        Parameters:
-        -----------
-        size: int
-            Length of the array.
-        data_ptr: void*
-            Pointer to the data            
-
-        """
-        self.data_ptr = data_ptr
-        self.size = size
+    cdef set_data(self, void* data_ptr, object shape, object strides, object dtype, _LuaObject larray):
+        self.data_ptr = <void*> data_ptr
+        self.shape = shape
+        self.strides = strides
+        self.dtype = dtype
+        self.larray = larray
+        # increase lua reference count
+        top = lua.lua_gettop(larray._state)
+        lua.lua_pushvalue(larray._state, top+1)
+        self._ref = lua.luaL_ref(larray._state, lua.LUA_REGISTRYINDEX)
 
     def __array__(self):
-        """ Here we use the __array__ method, that is called when numpy
-            tries to get an array from the object."""
-        cdef np.npy_intp shape[1]
-        shape[0] = <np.npy_intp> self.size
-        # Create a 1D array, of length 'size'
-        ndarray = np.PyArray_SimpleNewFromData(1, shape,
-                                               np.NPY_INT, self.data_ptr)
+        print "LuaArrayWrapper: __array__"
+        cdef int ndim = len(self.shape)
+        cdef int itemsize = 1
+        #TODO: determine correct type
+        cdef int typenum = np.NPY_INT 
+        cdef np.npy_intp *shape = <np.npy_intp*> malloc(ndim*sizeof(np.npy_intp))
+        cdef np.npy_intp *strides = <np.npy_intp*> malloc(ndim*sizeof(np.npy_intp))
+        for i in range(ndim):
+          itemsize = itemsize * self.shape[i+1]
+          shape[i] = self.shape[i+1]
+          strides[i] = self.strides[i+1]*sizeof(int)
+
+        ndarray = np.PyArray_New(np.ndarray, ndim, shape, typenum, strides, self.data_ptr, itemsize, 0, 0)
         return ndarray
 
     def __dealloc__(self):
-        """ Frees the array. This is called by Python when all the
-        references to the object are gone. """
-        free(<void*>self.data_ptr)
+        print "LuaArrayWrapper: dealloc"
+        if self.larray._runtime is None:
+            return
+        # decrease lua reference count
+        cdef lua_State* L = self.larray._state
+        try:
+            lock_runtime(self.larray._runtime)
+            locked = True
+        except:
+            locked = False
+        lua.luaL_unref(L, lua.LUA_REGISTRYINDEX, self._ref)
+        if locked:
+            unlock_runtime(self.larray._runtime)
 
 include "lock.pxi"
 
@@ -832,12 +855,13 @@ def as_itemgetter(obj):
     wrap._type_flags = OBJ_AS_INDEX
     return wrap
 
-cdef object py_from_lua(LuaRuntime runtime, lua_State *L, int n):
+cdef object py_from_lua(LuaRuntime runtime, lua_State *L, int n, int convert_larray = 1):
     cdef size_t size = 0
     cdef const_char_ptr s
     cdef lua.lua_Number number
     cdef py_object* py_obj
     cdef int lua_type = lua.lua_type(L, n)
+    cdef np.ndarray ndarray
 
     if lua_type == lua.LUA_TNIL:
         return None
@@ -860,7 +884,46 @@ cdef object py_from_lua(LuaRuntime runtime, lua_State *L, int n):
         if py_obj:
             return <object>py_obj.obj
     elif lua_type == lua.LUA_TTABLE:
-        return new_lua_table(runtime, L, n)
+        stack_size = lua.lua_gettop(L)
+        lt = new_lua_table(runtime, L, n)
+        if convert_larray: 
+          try:
+            lua.lua_getfield(L, n, "_type")
+            if lua.lua_isstring(L,lua.lua_gettop(L)) and str(lua.lua_tostring(L,lua.lua_gettop(L))) == "narray":
+              lua.lua_pop(L,1)
+
+              lua.lua_getfield(L, n, "shape")
+              assert(lua.lua_type(L, lua.lua_gettop(L)) == lua.LUA_TTABLE)
+              shape = py_from_lua(runtime,L,lua.lua_gettop(L))
+              lua.lua_pop(L,2)
+
+              lua.lua_getfield(L, n, "strides")
+              assert(lua.lua_type(L, lua.lua_gettop(L)) == lua.LUA_TTABLE)
+              strides = py_from_lua(runtime,L,lua.lua_gettop(L))
+              lua.lua_pop(L,2)
+
+              lua.lua_getfield(L, n, "dtype")
+              dtype = py_from_lua(runtime,L,lua.lua_gettop(L))
+              lua.lua_pop(L,1)
+
+              lua.lua_getfield(L, n, "data")
+              data = int(lua.lua_tonumber(L,lua.lua_gettop(L)))
+              data2 = <void*>(<int> int(data))
+              lua.lua_pop(L,1)
+
+              array_wrapper = LuaArrayWrapper()
+              Py_INCREF(array_wrapper)
+              array_wrapper.set_data(data2, shape, strides, dtype, lt)
+
+              ndarray = np.array(array_wrapper, copy=False)
+              # Assign our object to the 'base' of the ndarray object
+              ndarray.base = <PyObject *> array_wrapper
+              # Increment the reference count
+              lt = ndarray
+          except:
+            lua.lua_pop(L, lua.lua_gettop() - stack_size)
+            print "LUPA: ljarray -> ndarray conversion failed!"
+        return lt
     elif lua_type == lua.LUA_TTHREAD:
         return new_lua_thread_or_function(runtime, L, n)
     elif lua_type == lua.LUA_TFUNCTION:
@@ -899,7 +962,7 @@ cdef int py_to_lua(LuaRuntime runtime, lua_State *L, object o, bint withnone) ex
             runtime.reraise_on_exception()
             if result_status:
                 raise_lua_error(runtime, L, result_status)
-            retval = py_from_lua(runtime, L, stack_index + 1)
+            retval = py_from_lua(runtime, L, stack_index + 1, 0)
         finally:
             # restore lua stack pointer
             lua.lua_settop(L, stack_index)
