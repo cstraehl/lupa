@@ -15,6 +15,8 @@ cimport cpython.float
 cimport cpython.long
 from cpython.ref cimport PyObject 
 
+import os, string, inspect
+
 cdef extern from "Python.h":
     ctypedef struct PyTypeObject:
         pass
@@ -224,13 +226,37 @@ cdef class LuaRuntime:
         except:
           pass
         # try loading ljarray
+        narray = self.require("ljarray.narray")
         try:
           narray = self.require("ljarray.narray")
           print("LUPA: loaded ljarray.narray")
           _has_ljarray = 1
           self._convert_ndarray = narray.fromNumpyArray
-        except:
+          self.add_cur_dir_to_path()
+        except Exception as e:
           print("LUPA: you may want to install LJARRAY for automatic numpy.ndarray <-> luajit interop")
+          print(e)
+
+    def add_dir_to_path(self, path):
+        old_path = self.eval("package.path")
+        new_path = path+"/?.so;"+path+"/?.lua;"+old_path
+        self.execute("package.path = '%s'" % new_path)
+
+    def remove_dir_from_path(self, path):
+        cur_path = self.eval("package.path")
+        cur_path =  string.replace(cur_path,path+"/?.so;","",1)
+        cur_path =  string.replace(cur_path,path+"/?.lua;","",1)
+        self.execute("package.path='%s'" % cur_path)
+
+    def add_cur_dir_to_path(self):
+        path = inspect.stack()[0][1]
+        path = string.join(os.path.abspath(path).split("/")[:-1],"/")
+        self.add_dir_to_path(path)
+
+    def remove_cur_dir_from_path(self):
+        path = inspect.stack()[0][1]
+        path = string.join(os.path.abspath(path).split("/")[:-1],"/")
+        self.remove_dir_from_path(path)
     
     def __dealloc__(self):
         if self._state is not NULL:
@@ -271,6 +297,10 @@ cdef class LuaRuntime:
         cdef lua_State *L = self._state
         if not isinstance(modulename, (bytes, unicode)):
             raise TypeError("modulename must be a string")
+        
+        # include current .py directory in package.path
+        self.add_cur_dir_to_path()
+
         lock_runtime(self)
         try:
             lua.lua_pushlstring(L, 'require', 7)
@@ -278,9 +308,14 @@ cdef class LuaRuntime:
             if lua.lua_isnil(L, -1):
                 lua.lua_pop(L, 1)
                 raise LuaError("require is not defined")
-            return call_lua(self, L, (modulename,))
+            answer = call_lua(self, L, (modulename,))
+            return answer
         finally:
             unlock_runtime(self)
+            
+            # remove part of package.path which we added
+            self.remove_cur_dir_from_path()
+
 
     def globals(self):
         """Return the globals defined in this Lua runtime as a Lua
