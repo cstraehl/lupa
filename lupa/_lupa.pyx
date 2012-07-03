@@ -79,10 +79,12 @@ cdef class LuaArrayWrapper:
     cdef object shape
     cdef object strides
     cdef object dtype
+    cdef object ndim
 
-    cdef set_data(self, void* data_ptr, object shape, object strides, object dtype, _LuaObject larray):
+    cdef set_data(self, void* data_ptr, object ndim, object shape, object strides, object dtype, _LuaObject larray):
         self.data_ptr = <void*> data_ptr
         self.shape = shape
+        self.ndim = ndim
         self.strides = strides
         self.dtype = dtype
         self.larray = larray
@@ -92,17 +94,17 @@ cdef class LuaArrayWrapper:
         self._ref = lua.luaL_ref(larray._state, lua.LUA_REGISTRYINDEX)
 
     def __array__(self):
-        print "LuaArrayWrapper: __array__"
-        cdef int ndim = len(self.shape)
+        print "LuaArrayWrapper: __array__", self.dtype
+        cdef int ndim = self.ndim
         cdef int itemsize = 1
         #TODO: determine correct type
         cdef int typenum = np.NPY_INT 
         cdef np.npy_intp *shape = <np.npy_intp*> malloc(ndim*sizeof(np.npy_intp))
         cdef np.npy_intp *strides = <np.npy_intp*> malloc(ndim*sizeof(np.npy_intp))
         for i in range(ndim):
-          itemsize = itemsize * self.shape[i+1]
-          shape[i] = self.shape[i+1]
-          strides[i] = self.strides[i+1]*sizeof(int)
+          itemsize = itemsize * self.shape[i]
+          shape[i] = self.shape[i]
+          strides[i] = self.strides[i]*sizeof(int)
 
         ndarray = np.PyArray_New(np.ndarray, ndim, shape, typenum, strides, self.data_ptr, itemsize, 0, 0)
         return ndarray
@@ -855,13 +857,52 @@ def as_itemgetter(obj):
     wrap._type_flags = OBJ_AS_INDEX
     return wrap
 
+cdef object ndarray_from_larray(LuaRuntime runtime, lua_State *L, n, lt):
+    stack_size = lua.lua_gettop(L)
+    cdef np.ndarray ndarray
+    try:
+        lua.lua_getfield(L, n, "shape")
+        assert(lua.lua_type(L, lua.lua_gettop(L)) == lua.LUA_TTABLE)
+        shape = py_from_lua(runtime,L,lua.lua_gettop(L))
+        lua.lua_pop(L,2)
+
+        lua.lua_getfield(L, n, "strides")
+        assert(lua.lua_type(L, lua.lua_gettop(L)) == lua.LUA_TTABLE)
+        strides = py_from_lua(runtime,L,lua.lua_gettop(L))
+        lua.lua_pop(L,2)
+
+        lua.lua_getfield(L, n, "dtype")
+        dtype = py_from_lua(runtime,L,lua.lua_gettop(L))
+        lua.lua_pop(L,1)
+        
+        lua.lua_getfield(L, n, "ndim")
+        ndim = py_from_lua(runtime,L,lua.lua_gettop(L))
+        lua.lua_pop(L,1)
+
+        lua.lua_getfield(L, n, "data")
+        data = int(lua.lua_tonumber(L,lua.lua_gettop(L)))
+        data2 = <void*>(<int> int(data))
+        lua.lua_pop(L,1)
+
+        array_wrapper = LuaArrayWrapper()
+        Py_INCREF(array_wrapper)
+        array_wrapper.set_data(data2, ndim,shape, strides, dtype, lt)
+
+        ndarray = np.array(array_wrapper, copy=False)
+        # Assign our object to the 'base' of the ndarray object
+        ndarray.base = <PyObject *> array_wrapper
+        # Increment the reference count
+        return ndarray
+    except Exception as err:
+      lua.lua_pop(L, lua.lua_gettop(L) - stack_size)
+      print "LUPA: ljarray -> ndarray conversion failed!"
+
 cdef object py_from_lua(LuaRuntime runtime, lua_State *L, int n, int convert_larray = 1):
     cdef size_t size = 0
     cdef const_char_ptr s
     cdef lua.lua_Number number
     cdef py_object* py_obj
     cdef int lua_type = lua.lua_type(L, n)
-    cdef np.ndarray ndarray
 
     if lua_type == lua.LUA_TNIL:
         return None
@@ -887,42 +928,12 @@ cdef object py_from_lua(LuaRuntime runtime, lua_State *L, int n, int convert_lar
         stack_size = lua.lua_gettop(L)
         lt = new_lua_table(runtime, L, n)
         if convert_larray: 
-          try:
+            # convert ljarray to ndarray
             lua.lua_getfield(L, n, "_type")
             if lua.lua_isstring(L,lua.lua_gettop(L)) and str(lua.lua_tostring(L,lua.lua_gettop(L))) == "narray":
-              lua.lua_pop(L,1)
+                lua.lua_pop(L,1)
 
-              lua.lua_getfield(L, n, "shape")
-              assert(lua.lua_type(L, lua.lua_gettop(L)) == lua.LUA_TTABLE)
-              shape = py_from_lua(runtime,L,lua.lua_gettop(L))
-              lua.lua_pop(L,2)
-
-              lua.lua_getfield(L, n, "strides")
-              assert(lua.lua_type(L, lua.lua_gettop(L)) == lua.LUA_TTABLE)
-              strides = py_from_lua(runtime,L,lua.lua_gettop(L))
-              lua.lua_pop(L,2)
-
-              lua.lua_getfield(L, n, "dtype")
-              dtype = py_from_lua(runtime,L,lua.lua_gettop(L))
-              lua.lua_pop(L,1)
-
-              lua.lua_getfield(L, n, "data")
-              data = int(lua.lua_tonumber(L,lua.lua_gettop(L)))
-              data2 = <void*>(<int> int(data))
-              lua.lua_pop(L,1)
-
-              array_wrapper = LuaArrayWrapper()
-              Py_INCREF(array_wrapper)
-              array_wrapper.set_data(data2, shape, strides, dtype, lt)
-
-              ndarray = np.array(array_wrapper, copy=False)
-              # Assign our object to the 'base' of the ndarray object
-              ndarray.base = <PyObject *> array_wrapper
-              # Increment the reference count
-              lt = ndarray
-          except:
-            lua.lua_pop(L, lua.lua_gettop() - stack_size)
-            print "LUPA: ljarray -> ndarray conversion failed!"
+                lt = ndarray_from_larray(runtime, L, n, lt)
         return lt
     elif lua_type == lua.LUA_TTHREAD:
         return new_lua_thread_or_function(runtime, L, n)
@@ -951,6 +962,8 @@ cdef int py_to_lua(LuaRuntime runtime, lua_State *L, object o, bint withnone) ex
             lua.lua_pushnil(L)
             pushed_values_count = 1
     elif type(o) is np.ndarray and runtime._convert_ndarray:
+        # convert ndarray to ljarray
+
         # save lua stack pointer
         stack_index = lua.lua_gettop(L)
         runtime._convert_ndarray.push_lua_object()
