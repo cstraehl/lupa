@@ -71,6 +71,17 @@ np.import_array()
 # We need to build an array-wrapper class to deallocate our array when
 # the Python object is deleted.
 
+ljarray_types = {
+    "int" : np.NPY_INT8
+    ,"int" : np.NPY_INT32
+    ,"int64" : np.NPY_INT64
+    ,"uint8" : np.NPY_UINT8
+    ,"uint32" : np.NPY_UINT32
+    ,"uint64" : np.NPY_UINT64
+    ,"float" : np.NPY_FLOAT32
+    ,"double" : np.NPY_FLOAT32
+}
+
 cdef class LuaArrayWrapper:
     cdef _LuaObject larray
     cdef void* data_ptr
@@ -78,7 +89,7 @@ cdef class LuaArrayWrapper:
     cdef int _ref
     cdef object shape
     cdef object strides
-    cdef object dtype
+    cdef int dtype
     cdef object ndim
 
     cdef set_data(self, void* data_ptr, object ndim, object shape, object strides, object dtype, _LuaObject larray):
@@ -86,7 +97,9 @@ cdef class LuaArrayWrapper:
         self.shape = shape
         self.ndim = ndim
         self.strides = strides
-        self.dtype = dtype
+        dtype = dtype[6:-1]
+        assert(ljarray_types.has_key(dtype), "ERROR: lupa ljarray dtype '%s' is unknown" %dtype)
+        self.dtype = ljarray_types[dtype]
         self.larray = larray
         # increase lua reference count
         top = lua.lua_gettop(larray._state)
@@ -94,11 +107,11 @@ cdef class LuaArrayWrapper:
         self._ref = lua.luaL_ref(larray._state, lua.LUA_REGISTRYINDEX)
 
     def __array__(self):
-        print "LuaArrayWrapper: __array__", self.dtype
+        print "LuaArrayWrapper: __array__"
         cdef int ndim = self.ndim
         cdef int itemsize = 1
         #TODO: determine correct type
-        cdef int typenum = np.NPY_INT 
+        cdef int typenum = self.dtype
         cdef np.npy_intp *shape = <np.npy_intp*> malloc(ndim*sizeof(np.npy_intp))
         cdef np.npy_intp *strides = <np.npy_intp*> malloc(ndim*sizeof(np.npy_intp))
         for i in range(ndim):
@@ -871,7 +884,7 @@ cdef object ndarray_from_larray(LuaRuntime runtime, lua_State *L, n, lt):
         strides = py_from_lua(runtime,L,lua.lua_gettop(L))
         lua.lua_pop(L,2)
 
-        lua.lua_getfield(L, n, "dtype")
+        lua.lua_getfield(L, n, "str_dtype")
         dtype = py_from_lua(runtime,L,lua.lua_gettop(L))
         lua.lua_pop(L,1)
         
