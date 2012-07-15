@@ -226,12 +226,12 @@ cdef class LuaRuntime:
         except:
           pass
         # try loading ljarray
-        narray = self.require("ljarray.narray")
+        array = self.require("ljarray.array")
         try:
-          narray = self.require("ljarray.narray")
-          print("LUPA: loaded ljarray.narray")
+          array = self.require("ljarray.array")
+          print("LUPA: loaded ljarray.array")
           _has_ljarray = 1
-          self._convert_ndarray = narray.fromNumpyArray
+          self._convert_ndarray = array.fromNumpyArray
           self.add_cur_dir_to_path()
         except Exception as e:
           print("LUPA: you may want to install LJARRAY for automatic numpy.ndarray <-> luajit interop")
@@ -942,8 +942,10 @@ cdef object ndarray_from_larray(LuaRuntime runtime, lua_State *L, n, lt):
         # Increment the reference count
         return ndarray
     except Exception as err:
-      lua.lua_pop(L, lua.lua_gettop(L) - stack_size)
-      print "LUPA: ljarray -> ndarray conversion failed!"
+       lua.lua_pop(L, lua.lua_gettop(L) - stack_size)
+       print "LUPA: ljarray -> ndarray conversion failed!"
+       import traceback
+       traceback.print_exc(err)
 
 cdef object py_from_lua(LuaRuntime runtime, lua_State *L, int n, int convert_larray = 1):
     cdef size_t size = 0
@@ -978,7 +980,7 @@ cdef object py_from_lua(LuaRuntime runtime, lua_State *L, int n, int convert_lar
         if convert_larray: 
             # convert ljarray to ndarray
             lua.lua_getfield(L, n, "_type")
-            if lua.lua_isstring(L,lua.lua_gettop(L)) and str(lua.lua_tostring(L,lua.lua_gettop(L))) == "narray":
+            if lua.lua_isstring(L,lua.lua_gettop(L)) and str(lua.lua_tostring(L,lua.lua_gettop(L))) == "array":
                 lua.lua_pop(L,1)
 
                 lt = ndarray_from_larray(runtime, L, n, lt)
